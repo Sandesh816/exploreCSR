@@ -62,6 +62,14 @@ class BundleRecord:
 
 
 @dataclass(frozen=True)
+class ProposedBundleReview:
+    original_relation_ids: Tuple[int, ...]
+    normalized_relation_ids: Tuple[int, ...]
+    accepted: bool
+    rejection_reason: Optional[str]
+
+
+@dataclass(frozen=True)
 class VerifierContext:
     delta: frozenset[str]
     const_env: Dict[str, Fraction]
@@ -277,30 +285,73 @@ def normalize_candidate_bundle_indices(
     eq_pool: list[Equation],
     context: VerifierContext,
     max_bundle_size: int,
+    max_candidates: Optional[int] = None,
 ) -> list[Tuple[int, ...]]:
+    reviews = review_proposed_bundle_indices(
+        proposed_bundles,
+        eq_pool,
+        context,
+        max_bundle_size=max_bundle_size,
+        max_candidates=max_candidates,
+    )
+    return [
+        review.normalized_relation_ids
+        for review in reviews
+        if review.accepted
+    ]
+
+
+def review_proposed_bundle_indices(
+    proposed_bundles: Iterable[Iterable[int]],
+    eq_pool: list[Equation],
+    context: VerifierContext,
+    *,
+    max_bundle_size: int,
+    max_candidates: Optional[int] = None,
+) -> list[ProposedBundleReview]:
     if max_bundle_size <= 0:
         raise ValueError("max_bundle_size must be positive.")
 
     valid_relation_ids = set(range(len(eq_pool)))
-    normalized: list[Tuple[int, ...]] = []
     seen: Set[Tuple[int, ...]] = set()
+    accepted_count = 0
+    reviews: list[ProposedBundleReview] = []
 
     for bundle in proposed_bundles:
-        bundle_tuple = tuple(sorted(set(bundle)))
-        if not bundle_tuple:
-            continue
-        if len(bundle_tuple) > max_bundle_size:
-            continue
-        if any(idx not in valid_relation_ids for idx in bundle_tuple):
-            continue
-        if bundle_tuple in seen:
-            continue
-        if phase3_filter_reason(bundle_tuple, context) is not None:
-            continue
-        seen.add(bundle_tuple)
-        normalized.append(bundle_tuple)
+        original_tuple = tuple(bundle)
+        normalized_tuple = tuple(sorted(set(bundle)))
+        rejection_reason: Optional[str] = None
 
-    return normalized
+        if not normalized_tuple:
+            rejection_reason = "empty bundle"
+        elif len(normalized_tuple) > max_bundle_size:
+            rejection_reason = "bundle exceeds configured maximum size"
+        elif any(idx not in valid_relation_ids for idx in normalized_tuple):
+            rejection_reason = "bundle contains an invalid relation id"
+        elif normalized_tuple in seen:
+            rejection_reason = "duplicate normalized bundle"
+        else:
+            filter_reason = phase3_filter_reason(normalized_tuple, context)
+            if filter_reason is not None:
+                rejection_reason = filter_reason
+            elif max_candidates is not None and accepted_count >= max_candidates:
+                rejection_reason = "exceeds configured proposal cap"
+
+        accepted = rejection_reason is None
+        if accepted:
+            seen.add(normalized_tuple)
+            accepted_count += 1
+
+        reviews.append(
+            ProposedBundleReview(
+                original_relation_ids=original_tuple,
+                normalized_relation_ids=normalized_tuple,
+                accepted=accepted,
+                rejection_reason=rejection_reason,
+            )
+        )
+
+    return reviews
 
 
 def merge_candidate_bundle_indices(
@@ -740,10 +791,15 @@ def verify_and_materialize_candidate_bundles(
     candidate_bundle_indices: list[Tuple[int, ...]],
     context: Optional[VerifierContext] = None,
     max_extra_fixed: Optional[int] = None,
-) -> tuple[list[BundleRecord], Dict[Tuple[Tuple[str, Fraction], ...], list[ProgramProvenance]]]:
+) -> tuple[
+    list[BundleRecord],
+    Dict[Tuple[Tuple[str, Fraction], ...], list[ProgramProvenance]],
+    list[BundleRecord],
+]:
     context = context or build_verifier_context(c1, c2, eq_pool)
     seen: Set[Tuple[int, ...]] = set()
     verified_records: list[BundleRecord] = []
+    rejected_records: list[BundleRecord] = []
     for idxs in candidate_bundle_indices:
         idxs_tuple = tuple(idxs)
         if idxs_tuple in seen:
@@ -760,10 +816,12 @@ def verify_and_materialize_candidate_bundles(
         )
         if record.verification_passed:
             verified_records.append(record)
+        else:
+            rejected_records.append(record)
 
     census = build_c3_census(verified_records)
     annotated_records = annotate_records_with_c3_census(verified_records, census)
-    return annotated_records, census
+    return annotated_records, census, rejected_records
 
 
 def print_bundle_summary(record: BundleRecord) -> None:

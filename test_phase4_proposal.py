@@ -10,6 +10,7 @@ from milestone1_analysis import (
     merge_candidate_bundle_indices,
     normalize_candidate_bundle_indices,
     build_verifier_context,
+    review_proposed_bundle_indices,
 )
 from milestone1_core import NamedRect, Rect, build_relation_records, detect_c1_equations
 
@@ -118,6 +119,29 @@ class ProposalNormalizationTests(unittest.TestCase):
         )
 
         self.assertEqual(normalized, [(cutter_height_pin, cutter_left_of_pizza)])
+
+    def test_review_proposed_bundle_indices_records_rejection_reasons(self) -> None:
+        cutter_height_pin = self.find_eq_index("+ cutter.h - 6 = + 0")
+        cutter_x_pin = self.find_eq_index("+ cutter.x + 4 = + 0")
+        cutter_left_of_pizza = self.find_eq_index("+ cutter.x - pizza.x + 2 = + 0")
+
+        reviews = review_proposed_bundle_indices(
+            [
+                [cutter_height_pin],
+                [cutter_x_pin],
+                [cutter_left_of_pizza, cutter_height_pin],
+                [cutter_left_of_pizza, cutter_height_pin],
+            ],
+            self.eq_pool,
+            self.context,
+            max_bundle_size=3,
+        )
+
+        self.assertEqual([review.accepted for review in reviews], [False, False, True, False])
+        self.assertEqual(reviews[0].rejection_reason, "filtered out by delta-overlap heuristic")
+        self.assertEqual(reviews[1].rejection_reason, "contradiction after fixing edited variables")
+        self.assertIsNone(reviews[2].rejection_reason)
+        self.assertEqual(reviews[3].rejection_reason, "duplicate normalized bundle")
 
     def test_merge_and_collect_candidate_bundle_indices_union_results(self) -> None:
         cutter_left_of_pizza = self.find_eq_index("+ cutter.x - pizza.x + 2 = + 0")

@@ -8,8 +8,10 @@ from typing import Optional
 
 from milestone1_analysis import (
     BundleRecord,
+    build_verifier_context,
     format_predicted_changes,
     print_bundle_summary,
+    review_proposed_bundle_indices,
     verify_and_materialize_candidate_bundles,
 )
 from milestone1_core import NamedRect, Rect, build_relation_records, detect_c1_equations
@@ -31,7 +33,6 @@ class PipelineConfig:
     proposal_rounds: int = 2
     bundles_per_round: int = 24
     global_bundle_cap: int = 128
-    ranking_top_k: int = 10
     linear_only: bool = True
     include_offsets: bool = True
     include_pins: bool = True
@@ -44,11 +45,32 @@ class PipelineConfig:
 
 
 @dataclass(frozen=True)
+class ProposedBundleLog:
+    round_index: int
+    candidate_id: str
+    relation_ids: tuple[int, ...]
+    rationale: str
+
+
+@dataclass(frozen=True)
+class RejectedBundleLog:
+    stage: str
+    relation_ids: tuple[int, ...]
+    reason: str
+    normalized_relation_ids: Optional[tuple[int, ...]] = None
+    round_index: Optional[int] = None
+    candidate_id: Optional[str] = None
+    rationale: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class PipelineRunResult:
     c1: list[NamedRect]
     c2: list[NamedRect]
     eq_pool_size: int
     proposal_results: list[BundleProposalResult]
+    all_proposed_bundles: list[ProposedBundleLog]
+    rejected_bundles: list[RejectedBundleLog]
     candidate_bundle_indices: list[tuple[int, ...]]
     verified_records: list[BundleRecord]
     ranking_result: RankingResult
@@ -106,6 +128,31 @@ def _serialize_bundle_record(record: BundleRecord) -> dict:
 def pipeline_result_to_dict(result: PipelineRunResult) -> dict:
     return {
         "eq_pool_size": result.eq_pool_size,
+        "all_proposed_bundles": [
+            {
+                "round_index": bundle.round_index,
+                "candidate_id": bundle.candidate_id,
+                "relation_ids": list(bundle.relation_ids),
+                "rationale": bundle.rationale,
+            }
+            for bundle in result.all_proposed_bundles
+        ],
+        "rejected_bundles": [
+            {
+                "stage": bundle.stage,
+                "relation_ids": list(bundle.relation_ids),
+                "normalized_relation_ids": (
+                    None
+                    if bundle.normalized_relation_ids is None
+                    else list(bundle.normalized_relation_ids)
+                ),
+                "reason": bundle.reason,
+                "round_index": bundle.round_index,
+                "candidate_id": bundle.candidate_id,
+                "rationale": bundle.rationale,
+            }
+            for bundle in result.rejected_bundles
+        ],
         "proposal_results": [
             {
                 "bundles": [
@@ -209,40 +256,77 @@ def run_pipeline(
     relation_pool = build_relation_records(eq_pool)
 
     proposal_results: list[BundleProposalResult] = []
+    all_proposed_bundles: list[ProposedBundleLog] = []
     proposed_bundles: list[tuple[int, ...]] = []
     previous_bundles: list[tuple[int, ...]] = []
-    for _ in range(config.proposal_rounds):
+    for round_index in range(1, config.proposal_rounds + 1):
+        remaining_budget = config.global_bundle_cap - len(proposed_bundles)
+        if remaining_budget <= 0:
+            break
         proposal_result = propose_relation_bundles_with_ollama(
             c1,
             c2,
             relation_pool,
             ollama_config,
-            max_bundles=config.bundles_per_round,
+            max_bundles=min(config.bundles_per_round, remaining_budget),
             max_bundle_size=config.max_system_size,
             previous_bundles=previous_bundles,
         )
         proposal_results.append(proposal_result)
         round_bundles = [bundle.relation_ids for bundle in proposal_result.bundles]
+        for bundle in proposal_result.bundles:
+            all_proposed_bundles.append(
+                ProposedBundleLog(
+                    round_index=round_index,
+                    candidate_id=bundle.candidate_id,
+                    relation_ids=bundle.relation_ids,
+                    rationale=bundle.rationale,
+                )
+            )
         proposed_bundles.extend(round_bundles)
         previous_bundles.extend(round_bundles)
 
-    from milestone1_analysis import collect_candidate_bundle_indices
-
-    candidate_bundle_indices = collect_candidate_bundle_indices(
-        c1,
-        c2,
+    context = build_verifier_context(c1, c2, eq_pool)
+    proposal_reviews = review_proposed_bundle_indices(
+        proposed_bundles,
         eq_pool,
-        proposed_bundles=proposed_bundles,
-        max_system_size=config.max_system_size,
+        context=context,
         max_bundle_size=config.max_system_size,
         max_candidates=config.global_bundle_cap,
     )
-    verified_records, _census = verify_and_materialize_candidate_bundles(
+    candidate_bundle_indices = [
+        review.normalized_relation_ids
+        for review in proposal_reviews
+        if review.accepted
+    ]
+    rejected_bundles = [
+        RejectedBundleLog(
+            stage="proposal_filter",
+            relation_ids=review.original_relation_ids,
+            normalized_relation_ids=review.normalized_relation_ids,
+            reason=review.rejection_reason or "rejected",
+            round_index=bundle.round_index,
+            candidate_id=bundle.candidate_id,
+            rationale=bundle.rationale,
+        )
+        for bundle, review in zip(all_proposed_bundles, proposal_reviews)
+        if not review.accepted
+    ]
+    verified_records, _census, verification_rejections = verify_and_materialize_candidate_bundles(
         c1,
         c2,
         eq_pool,
         candidate_bundle_indices,
         max_extra_fixed=config.max_extra_fixed,
+    )
+    rejected_bundles.extend(
+        RejectedBundleLog(
+            stage="verification",
+            relation_ids=record.eq_indices,
+            normalized_relation_ids=record.eq_indices,
+            reason=record.failure_reason or "verification failed",
+        )
+        for record in verification_rejections
     )
     if not verified_records:
         raise ValueError("No verified bundles were found for ranking.")
@@ -251,13 +335,13 @@ def run_pipeline(
         verified_records,
         user_history=user_history,
         config=ollama_config,
-        top_k=config.ranking_top_k,
+        top_k=len(verified_records),
         c1=c1,
         c2=c2,
     )
     candidate_lookup = {
         candidate_id: record
-        for candidate_id, record in enumerate(verified_records[: config.ranking_top_k], start=1)
+        for candidate_id, record in enumerate(verified_records, start=1)
     }
 
     return PipelineRunResult(
@@ -265,6 +349,8 @@ def run_pipeline(
         c2=c2,
         eq_pool_size=len(eq_pool),
         proposal_results=proposal_results,
+        all_proposed_bundles=all_proposed_bundles,
+        rejected_bundles=rejected_bundles,
         candidate_bundle_indices=candidate_bundle_indices,
         verified_records=verified_records,
         ranking_result=ranking_result,
@@ -275,9 +361,29 @@ def run_pipeline(
 def print_pipeline_result(result: PipelineRunResult) -> None:
     print(f"Equation pool size: {result.eq_pool_size}")
     print(f"Proposal rounds: {len(result.proposal_results)}")
-    print(f"Candidate bundles after merge: {len(result.candidate_bundle_indices)}")
-    print(f"Verified bundles: {len(result.verified_records)}")
+    print(f"All proposed bundles: {len(result.all_proposed_bundles)}")
+    print(f"Rejected bundles: {len(result.rejected_bundles)}")
+    print(f"Surviving verified bundles: {len(result.verified_records)}")
     print()
+    print("All proposed bundles:")
+    for bundle in result.all_proposed_bundles:
+        print(
+            f"- round {bundle.round_index} | {bundle.candidate_id} | "
+            f"{bundle.relation_ids} | {bundle.rationale}"
+        )
+
+    print()
+    print("Rejected bundles:")
+    if not result.rejected_bundles:
+        print("- none")
+    for bundle in result.rejected_bundles:
+        print(
+            f"- stage={bundle.stage} | relation_ids={bundle.relation_ids} | "
+            f"normalized={bundle.normalized_relation_ids} | reason={bundle.reason}"
+        )
+
+    print()
+    print("Final ranked bundles:")
     print(f"Ranking summary: {result.ranking_result.summary}")
     print(f"Chosen candidate: {result.ranking_result.chosen_candidate_id}")
 
@@ -309,7 +415,6 @@ def parse_args() -> PipelineConfig:
     parser.add_argument("--proposal-rounds", type=int, default=2)
     parser.add_argument("--bundles-per-round", type=int, default=24)
     parser.add_argument("--global-bundle-cap", type=int, default=128)
-    parser.add_argument("--ranking-top-k", type=int, default=10)
     parser.add_argument("--timeout-seconds", type=int, default=120)
     parser.add_argument("--temperature", type=float, default=0)
     parser.add_argument("--proposal-temperature", type=float, default=None)
@@ -328,7 +433,6 @@ def parse_args() -> PipelineConfig:
         proposal_rounds=args.proposal_rounds,
         bundles_per_round=args.bundles_per_round,
         global_bundle_cap=args.global_bundle_cap,
-        ranking_top_k=args.ranking_top_k,
         timeout_seconds=args.timeout_seconds,
         temperature=args.temperature,
         proposal_temperature=args.proposal_temperature,

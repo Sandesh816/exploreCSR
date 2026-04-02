@@ -26,7 +26,7 @@ class VerificationAndCensusTests(unittest.TestCase):
             (9, 22),
         ]
 
-        records, census = verify_and_materialize_candidate_bundles(
+        records, census, rejected_records = verify_and_materialize_candidate_bundles(
             self.c1,
             self.c2,
             self.eq_pool,
@@ -39,6 +39,7 @@ class VerificationAndCensusTests(unittest.TestCase):
         self.assertIn((14,), record_lookup)
         self.assertIn((0, 14), record_lookup)
         self.assertIn((9, 22), record_lookup)
+        self.assertIn((12,), {record.eq_indices for record in rejected_records})
 
         for record in records:
             self.assertTrue(record.verification_passed)

@@ -63,14 +63,15 @@ class RunPipelineTests(unittest.TestCase):
                 model_name="mock-model",
                 proposal_rounds=1,
                 bundles_per_round=4,
-                ranking_top_k=5,
             )
         )
 
         self.assertGreater(result.eq_pool_size, 0)
         self.assertEqual(len(result.proposal_results), 1)
+        self.assertEqual(len(result.all_proposed_bundles), 1)
         self.assertTrue(result.candidate_bundle_indices)
         self.assertTrue(result.verified_records)
+        self.assertEqual(result.rejected_bundles, [])
         self.assertEqual(result.ranking_result.chosen_candidate_id, 1)
         self.assertIn(1, result.candidate_lookup)
         self.assertTrue(
@@ -118,7 +119,6 @@ class RunPipelineTests(unittest.TestCase):
                 model_name="mock-model",
                 proposal_rounds=1,
                 bundles_per_round=4,
-                ranking_top_k=5,
             )
         )
 
@@ -128,6 +128,8 @@ class RunPipelineTests(unittest.TestCase):
             payload = json.loads(saved_path.read_text(encoding="utf-8"))
 
         self.assertEqual(saved_path, output_path)
+        self.assertEqual(payload["all_proposed_bundles"][0]["candidate_id"], "LLM-001")
+        self.assertEqual(payload["rejected_bundles"], [])
         self.assertEqual(payload["proposal_results"][0]["raw_prompt"], "proposal prompt")
         self.assertEqual(payload["ranking_result"]["raw_prompt"], "ranking prompt")
         self.assertIn("raw_content", payload["ranking_result"])
