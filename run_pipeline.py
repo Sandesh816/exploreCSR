@@ -1,0 +1,347 @@
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+import json
+from pathlib import Path
+from typing import Optional
+
+from milestone1_analysis import (
+    BundleRecord,
+    format_predicted_changes,
+    print_bundle_summary,
+    verify_and_materialize_candidate_bundles,
+)
+from milestone1_core import NamedRect, Rect, build_relation_records, detect_c1_equations
+from milestone1_ollama import (
+    BundleProposalResult,
+    OllamaRankerConfig,
+    RankingResult,
+    propose_relation_bundles_with_ollama,
+    rank_verified_bundles_with_ollama,
+)
+
+
+@dataclass(frozen=True)
+class PipelineConfig:
+    model_name: str
+    output_json_path: str = "runtime/pipeline_last_run.json"
+    max_system_size: int = 3
+    max_extra_fixed: Optional[int] = 2
+    proposal_rounds: int = 2
+    bundles_per_round: int = 24
+    global_bundle_cap: int = 128
+    ranking_top_k: int = 10
+    linear_only: bool = True
+    include_offsets: bool = True
+    include_pins: bool = True
+    timeout_seconds: int = 120
+    temperature: int | float = 0
+    proposal_temperature: int | float | None = None
+    ranking_temperature: int | float | None = None
+    keep_alive: str | None = "5m"
+    scene_name: str = "default"
+
+
+@dataclass(frozen=True)
+class PipelineRunResult:
+    c1: list[NamedRect]
+    c2: list[NamedRect]
+    eq_pool_size: int
+    proposal_results: list[BundleProposalResult]
+    candidate_bundle_indices: list[tuple[int, ...]]
+    verified_records: list[BundleRecord]
+    ranking_result: RankingResult
+    candidate_lookup: dict[int, BundleRecord]
+
+
+def _json_safe(value: object) -> object:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, tuple):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    return str(value)
+
+
+def _serialize_bundle_record(record: BundleRecord) -> dict:
+    return {
+        "eq_indices": list(record.eq_indices),
+        "equations": list(record.equations),
+        "support_vars": list(record.support_vars),
+        "delta_hit": record.delta_hit,
+        "changed_vars_hit": list(record.changed_vars_hit),
+        "has_shared_variable": record.has_shared_variable,
+        "has_connected_support": record.has_connected_support,
+        "verification_passed": record.verification_passed,
+        "min_extra_fixed": record.min_extra_fixed,
+        "has_parameterization_conflict": record.has_parameterization_conflict,
+        "unique_c3_count": record.unique_c3_count,
+        "failure_reason": record.failure_reason,
+        "viable_fixed_sets": [
+            {
+                "fixed_vars": list(option.fixed_vars),
+                "extra_fixed_vars": list(option.extra_fixed_vars),
+                "driven_vars": list(option.driven_vars),
+                "predicted_changes": [
+                    {
+                        "var": name,
+                        "before": _json_safe(before),
+                        "after": _json_safe(after),
+                    }
+                    for name, before, after in option.predicted_changes
+                ],
+                "c3_key": option.c3_key,
+                "c3_census_count": option.c3_census_count,
+                "program_text": option.program_text,
+            }
+            for option in record.viable_fixed_sets
+        ],
+    }
+
+
+def pipeline_result_to_dict(result: PipelineRunResult) -> dict:
+    return {
+        "eq_pool_size": result.eq_pool_size,
+        "proposal_results": [
+            {
+                "bundles": [
+                    {
+                        "candidate_id": bundle.candidate_id,
+                        "relation_ids": list(bundle.relation_ids),
+                        "rationale": bundle.rationale,
+                    }
+                    for bundle in proposal_result.bundles
+                ],
+                "raw_prompt": proposal_result.raw_prompt,
+                "raw_content": proposal_result.raw_content,
+                "raw_response_json": proposal_result.raw_response_json,
+            }
+            for proposal_result in result.proposal_results
+        ],
+        "candidate_bundle_indices": [list(bundle) for bundle in result.candidate_bundle_indices],
+        "verified_records": [_serialize_bundle_record(record) for record in result.verified_records],
+        "ranking_result": {
+            "summary": result.ranking_result.summary,
+            "chosen_candidate_id": result.ranking_result.chosen_candidate_id,
+            "ranked_candidates": [
+                {
+                    "candidate_id": ranked.candidate_id,
+                    "bundle_rank": ranked.bundle_rank,
+                    "score": ranked.score,
+                    "keep": ranked.keep,
+                    "rationale": ranked.rationale,
+                }
+                for ranked in result.ranking_result.ranked_candidates
+            ],
+            "raw_prompt": result.ranking_result.raw_prompt,
+            "raw_content": result.ranking_result.raw_content,
+            "raw_response_json": result.ranking_result.raw_response_json,
+        },
+    }
+
+
+def save_pipeline_result(result: PipelineRunResult, output_json_path: str) -> Path:
+    output_path = Path(output_json_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(_json_safe(pipeline_result_to_dict(result)), indent=2),
+        encoding="utf-8",
+    )
+    return output_path
+
+
+def build_demo_scene(scene_name: str) -> tuple[list[NamedRect], list[NamedRect]]:
+    if scene_name == "default":
+        pizza = NamedRect("pizza", Rect(-2, 3, 3, 4))
+        cutter = NamedRect("cutter", Rect(-4, 3, 1, 6))
+        c1 = [pizza, cutter]
+        c2 = [pizza, NamedRect("cutter", Rect(-5, 3, 1, 6))]
+        return c1, c2
+
+    if scene_name == "three-object":
+        pizza = NamedRect("pizza", Rect(-2, 3, 3, 4))
+        cutter = NamedRect("cutter", Rect(-4, 3, 1, 6))
+        plate = NamedRect("plate", Rect(-3, 0, 8, 1))
+        c1 = [pizza, cutter, plate]
+        c2 = [
+            NamedRect("pizza", Rect(-2, 4, 3, 4)),
+            cutter,
+            NamedRect("plate", Rect(-3, 1, 8, 1)),
+        ]
+        return c1, c2
+
+    raise ValueError(f"Unknown scene_name: {scene_name!r}")
+
+
+def build_ollama_config(config: PipelineConfig) -> OllamaRankerConfig:
+    return OllamaRankerConfig(
+        model_name=config.model_name,
+        timeout_seconds=config.timeout_seconds,
+        temperature=config.temperature,
+        proposal_temperature=config.proposal_temperature,
+        ranking_temperature=config.ranking_temperature,
+        keep_alive=config.keep_alive,
+    )
+
+
+def run_pipeline(
+    config: PipelineConfig,
+    *,
+    c1: Optional[list[NamedRect]] = None,
+    c2: Optional[list[NamedRect]] = None,
+    user_history: Optional[str] = None,
+) -> PipelineRunResult:
+    if c1 is None or c2 is None:
+        c1, c2 = build_demo_scene(config.scene_name)
+
+    ollama_config = build_ollama_config(config)
+    eq_pool = detect_c1_equations(
+        c1,
+        include_offsets=config.include_offsets,
+        include_pins=config.include_pins,
+        linear_only=config.linear_only,
+        print_list=False,
+    )
+    relation_pool = build_relation_records(eq_pool)
+
+    proposal_results: list[BundleProposalResult] = []
+    proposed_bundles: list[tuple[int, ...]] = []
+    previous_bundles: list[tuple[int, ...]] = []
+    for _ in range(config.proposal_rounds):
+        proposal_result = propose_relation_bundles_with_ollama(
+            c1,
+            c2,
+            relation_pool,
+            ollama_config,
+            max_bundles=config.bundles_per_round,
+            max_bundle_size=config.max_system_size,
+            previous_bundles=previous_bundles,
+        )
+        proposal_results.append(proposal_result)
+        round_bundles = [bundle.relation_ids for bundle in proposal_result.bundles]
+        proposed_bundles.extend(round_bundles)
+        previous_bundles.extend(round_bundles)
+
+    from milestone1_analysis import collect_candidate_bundle_indices
+
+    candidate_bundle_indices = collect_candidate_bundle_indices(
+        c1,
+        c2,
+        eq_pool,
+        proposed_bundles=proposed_bundles,
+        max_system_size=config.max_system_size,
+        max_bundle_size=config.max_system_size,
+        max_candidates=config.global_bundle_cap,
+    )
+    verified_records, _census = verify_and_materialize_candidate_bundles(
+        c1,
+        c2,
+        eq_pool,
+        candidate_bundle_indices,
+        max_extra_fixed=config.max_extra_fixed,
+    )
+    if not verified_records:
+        raise ValueError("No verified bundles were found for ranking.")
+
+    ranking_result = rank_verified_bundles_with_ollama(
+        verified_records,
+        user_history=user_history,
+        config=ollama_config,
+        top_k=config.ranking_top_k,
+        c1=c1,
+        c2=c2,
+    )
+    candidate_lookup = {
+        candidate_id: record
+        for candidate_id, record in enumerate(verified_records[: config.ranking_top_k], start=1)
+    }
+
+    return PipelineRunResult(
+        c1=c1,
+        c2=c2,
+        eq_pool_size=len(eq_pool),
+        proposal_results=proposal_results,
+        candidate_bundle_indices=candidate_bundle_indices,
+        verified_records=verified_records,
+        ranking_result=ranking_result,
+        candidate_lookup=candidate_lookup,
+    )
+
+
+def print_pipeline_result(result: PipelineRunResult) -> None:
+    print(f"Equation pool size: {result.eq_pool_size}")
+    print(f"Proposal rounds: {len(result.proposal_results)}")
+    print(f"Candidate bundles after merge: {len(result.candidate_bundle_indices)}")
+    print(f"Verified bundles: {len(result.verified_records)}")
+    print()
+    print(f"Ranking summary: {result.ranking_result.summary}")
+    print(f"Chosen candidate: {result.ranking_result.chosen_candidate_id}")
+
+    for ranked in result.ranking_result.ranked_candidates:
+        record = result.candidate_lookup.get(ranked.candidate_id)
+        if record is None:
+            continue
+        print()
+        print(
+            f"Rank {ranked.bundle_rank}: candidate {ranked.candidate_id} "
+            f"(score={ranked.score}, keep={ranked.keep})"
+        )
+        print(f"Rationale: {ranked.rationale}")
+        print(f"Bundle: {record.eq_indices}")
+        if record.viable_fixed_sets:
+            option = record.viable_fixed_sets[0]
+            print(f"Predicted changes: {format_predicted_changes(option.predicted_changes)}")
+            print(f"C3 census count: {option.c3_census_count}")
+        print_bundle_summary(record)
+
+
+def parse_args() -> PipelineConfig:
+    parser = argparse.ArgumentParser(description="Run the C1 -> ranked C3 prediction pipeline.")
+    parser.add_argument("--model-name", required=True)
+    parser.add_argument("--output-json", default="runtime/pipeline_last_run.json")
+    parser.add_argument("--scene-name", default="default", choices=["default", "three-object"])
+    parser.add_argument("--max-system-size", type=int, default=3)
+    parser.add_argument("--max-extra-fixed", type=int, default=2)
+    parser.add_argument("--proposal-rounds", type=int, default=2)
+    parser.add_argument("--bundles-per-round", type=int, default=24)
+    parser.add_argument("--global-bundle-cap", type=int, default=128)
+    parser.add_argument("--ranking-top-k", type=int, default=10)
+    parser.add_argument("--timeout-seconds", type=int, default=120)
+    parser.add_argument("--temperature", type=float, default=0)
+    parser.add_argument("--proposal-temperature", type=float, default=None)
+    parser.add_argument("--ranking-temperature", type=float, default=None)
+    parser.add_argument("--disable-offsets", action="store_true")
+    parser.add_argument("--disable-pins", action="store_true")
+    parser.add_argument("--include-nonlinear", action="store_true")
+    args = parser.parse_args()
+
+    return PipelineConfig(
+        model_name=args.model_name,
+        output_json_path=args.output_json,
+        scene_name=args.scene_name,
+        max_system_size=args.max_system_size,
+        max_extra_fixed=args.max_extra_fixed,
+        proposal_rounds=args.proposal_rounds,
+        bundles_per_round=args.bundles_per_round,
+        global_bundle_cap=args.global_bundle_cap,
+        ranking_top_k=args.ranking_top_k,
+        timeout_seconds=args.timeout_seconds,
+        temperature=args.temperature,
+        proposal_temperature=args.proposal_temperature,
+        ranking_temperature=args.ranking_temperature,
+        include_offsets=not args.disable_offsets,
+        include_pins=not args.disable_pins,
+        linear_only=not args.include_nonlinear,
+    )
+
+
+if __name__ == "__main__":
+    pipeline_config = parse_args()
+    pipeline_result = run_pipeline(pipeline_config)
+    output_path = save_pipeline_result(pipeline_result, pipeline_config.output_json_path)
+    print(f"Saved pipeline result JSON: {output_path}")
+    print_pipeline_result(pipeline_result)
