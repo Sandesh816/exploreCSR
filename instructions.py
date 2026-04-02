@@ -74,6 +74,9 @@ def build_bundle_proposal_messages(
     lines.append(f"- Propose at most {max_bundles} bundles.")
     lines.append(f"- Each bundle may include at most {max_bundle_size} relation IDs.")
     lines.append("- Prefer diversity across the proposed bundles.")
+    lines.append("- Each bundle must have a unique non-empty candidate_id.")
+    lines.append("- Do not repeat an exact relation-id bundle that already appeared earlier in this response.")
+    lines.append("- If previous rounds are provided, do not repeat those exact bundles; use the remaining budget on distinct alternatives.")
 
     if previous_bundles:
         lines.append("")

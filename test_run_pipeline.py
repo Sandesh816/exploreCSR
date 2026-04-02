@@ -68,6 +68,12 @@ class RunPipelineTests(unittest.TestCase):
 
         self.assertGreater(result.eq_pool_size, 0)
         self.assertEqual(len(result.proposal_results), 1)
+        self.assertEqual(len(result.proposal_round_timings), 1)
+        self.assertGreaterEqual(result.proposal_phase_seconds, 0)
+        self.assertGreaterEqual(result.proposal_filter_phase_seconds, 0)
+        self.assertGreaterEqual(result.verification_phase_seconds, 0)
+        self.assertGreaterEqual(result.ranking_phase_seconds, 0)
+        self.assertGreaterEqual(result.total_seconds, 0)
         self.assertEqual(len(result.all_proposed_bundles), 1)
         self.assertTrue(result.candidate_bundle_indices)
         self.assertTrue(result.verified_records)
@@ -128,6 +134,8 @@ class RunPipelineTests(unittest.TestCase):
             payload = json.loads(saved_path.read_text(encoding="utf-8"))
 
         self.assertEqual(saved_path, output_path)
+        self.assertIn("timings", payload)
+        self.assertEqual(payload["timings"]["proposal_rounds"][0]["round_index"], 1)
         self.assertEqual(payload["all_proposed_bundles"][0]["candidate_id"], "LLM-001")
         self.assertEqual(payload["rejected_bundles"], [])
         self.assertEqual(payload["proposal_results"][0]["raw_prompt"], "proposal prompt")

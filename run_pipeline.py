@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from dataclasses import dataclass
 import json
 from pathlib import Path
+from time import perf_counter
 from typing import Optional
 
 from milestone1_analysis import (
@@ -64,11 +66,25 @@ class RejectedBundleLog:
 
 
 @dataclass(frozen=True)
+class ProposalRoundTiming:
+    round_index: int
+    requested_max_bundles: int
+    returned_bundle_count: int
+    elapsed_seconds: float
+
+
+@dataclass(frozen=True)
 class PipelineRunResult:
     c1: list[NamedRect]
     c2: list[NamedRect]
     eq_pool_size: int
     proposal_results: list[BundleProposalResult]
+    proposal_round_timings: list[ProposalRoundTiming]
+    proposal_phase_seconds: float
+    proposal_filter_phase_seconds: float
+    verification_phase_seconds: float
+    ranking_phase_seconds: float
+    total_seconds: float
     all_proposed_bundles: list[ProposedBundleLog]
     rejected_bundles: list[RejectedBundleLog]
     candidate_bundle_indices: list[tuple[int, ...]]
@@ -128,6 +144,22 @@ def _serialize_bundle_record(record: BundleRecord) -> dict:
 def pipeline_result_to_dict(result: PipelineRunResult) -> dict:
     return {
         "eq_pool_size": result.eq_pool_size,
+        "timings": {
+            "proposal_rounds": [
+                {
+                    "round_index": timing.round_index,
+                    "requested_max_bundles": timing.requested_max_bundles,
+                    "returned_bundle_count": timing.returned_bundle_count,
+                    "elapsed_seconds": timing.elapsed_seconds,
+                }
+                for timing in result.proposal_round_timings
+            ],
+            "proposal_phase_seconds": result.proposal_phase_seconds,
+            "proposal_filter_phase_seconds": result.proposal_filter_phase_seconds,
+            "verification_phase_seconds": result.verification_phase_seconds,
+            "ranking_phase_seconds": result.ranking_phase_seconds,
+            "total_seconds": result.total_seconds,
+        },
         "all_proposed_bundles": [
             {
                 "round_index": bundle.round_index,
@@ -201,6 +233,16 @@ def save_pipeline_result(result: PipelineRunResult, output_json_path: str) -> Pa
     return output_path
 
 
+def _print_heading(title: str) -> None:
+    print()
+    print(f"=== {title} ===")
+
+
+def _rejection_reason_counts(rejected_bundles: list[RejectedBundleLog]) -> list[tuple[str, int]]:
+    counts = Counter(bundle.reason for bundle in rejected_bundles)
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+
+
 def build_demo_scene(scene_name: str) -> tuple[list[NamedRect], list[NamedRect]]:
     if scene_name == "default":
         pizza = NamedRect("pizza", Rect(-2, 3, 3, 4))
@@ -242,6 +284,7 @@ def run_pipeline(
     c2: Optional[list[NamedRect]] = None,
     user_history: Optional[str] = None,
 ) -> PipelineRunResult:
+    pipeline_start = perf_counter()
     if c1 is None or c2 is None:
         c1, c2 = build_demo_scene(config.scene_name)
 
@@ -256,23 +299,36 @@ def run_pipeline(
     relation_pool = build_relation_records(eq_pool)
 
     proposal_results: list[BundleProposalResult] = []
+    proposal_round_timings: list[ProposalRoundTiming] = []
     all_proposed_bundles: list[ProposedBundleLog] = []
     proposed_bundles: list[tuple[int, ...]] = []
     previous_bundles: list[tuple[int, ...]] = []
+    proposal_phase_start = perf_counter()
     for round_index in range(1, config.proposal_rounds + 1):
         remaining_budget = config.global_bundle_cap - len(proposed_bundles)
         if remaining_budget <= 0:
             break
+        requested_max_bundles = min(config.bundles_per_round, remaining_budget)
+        round_start = perf_counter()
         proposal_result = propose_relation_bundles_with_ollama(
             c1,
             c2,
             relation_pool,
             ollama_config,
-            max_bundles=min(config.bundles_per_round, remaining_budget),
+            max_bundles=requested_max_bundles,
             max_bundle_size=config.max_system_size,
             previous_bundles=previous_bundles,
         )
+        round_elapsed = perf_counter() - round_start
         proposal_results.append(proposal_result)
+        proposal_round_timings.append(
+            ProposalRoundTiming(
+                round_index=round_index,
+                requested_max_bundles=requested_max_bundles,
+                returned_bundle_count=len(proposal_result.bundles),
+                elapsed_seconds=round_elapsed,
+            )
+        )
         round_bundles = [bundle.relation_ids for bundle in proposal_result.bundles]
         for bundle in proposal_result.bundles:
             all_proposed_bundles.append(
@@ -285,8 +341,10 @@ def run_pipeline(
             )
         proposed_bundles.extend(round_bundles)
         previous_bundles.extend(round_bundles)
+    proposal_phase_seconds = perf_counter() - proposal_phase_start
 
     context = build_verifier_context(c1, c2, eq_pool)
+    proposal_filter_start = perf_counter()
     proposal_reviews = review_proposed_bundle_indices(
         proposed_bundles,
         eq_pool,
@@ -294,6 +352,7 @@ def run_pipeline(
         max_bundle_size=config.max_system_size,
         max_candidates=config.global_bundle_cap,
     )
+    proposal_filter_phase_seconds = perf_counter() - proposal_filter_start
     candidate_bundle_indices = [
         review.normalized_relation_ids
         for review in proposal_reviews
@@ -312,6 +371,7 @@ def run_pipeline(
         for bundle, review in zip(all_proposed_bundles, proposal_reviews)
         if not review.accepted
     ]
+    verification_start = perf_counter()
     verified_records, _census, verification_rejections = verify_and_materialize_candidate_bundles(
         c1,
         c2,
@@ -319,6 +379,7 @@ def run_pipeline(
         candidate_bundle_indices,
         max_extra_fixed=config.max_extra_fixed,
     )
+    verification_phase_seconds = perf_counter() - verification_start
     rejected_bundles.extend(
         RejectedBundleLog(
             stage="verification",
@@ -331,6 +392,7 @@ def run_pipeline(
     if not verified_records:
         raise ValueError("No verified bundles were found for ranking.")
 
+    ranking_start = perf_counter()
     ranking_result = rank_verified_bundles_with_ollama(
         verified_records,
         user_history=user_history,
@@ -339,6 +401,7 @@ def run_pipeline(
         c1=c1,
         c2=c2,
     )
+    ranking_phase_seconds = perf_counter() - ranking_start
     candidate_lookup = {
         candidate_id: record
         for candidate_id, record in enumerate(verified_records, start=1)
@@ -349,6 +412,12 @@ def run_pipeline(
         c2=c2,
         eq_pool_size=len(eq_pool),
         proposal_results=proposal_results,
+        proposal_round_timings=proposal_round_timings,
+        proposal_phase_seconds=proposal_phase_seconds,
+        proposal_filter_phase_seconds=proposal_filter_phase_seconds,
+        verification_phase_seconds=verification_phase_seconds,
+        ranking_phase_seconds=ranking_phase_seconds,
+        total_seconds=perf_counter() - pipeline_start,
         all_proposed_bundles=all_proposed_bundles,
         rejected_bundles=rejected_bundles,
         candidate_bundle_indices=candidate_bundle_indices,
@@ -359,31 +428,55 @@ def run_pipeline(
 
 
 def print_pipeline_result(result: PipelineRunResult) -> None:
+    _print_heading("Timings")
+    for timing in result.proposal_round_timings:
+        print(
+            f"- generator round {timing.round_index}: {timing.elapsed_seconds:.2f}s "
+            f"(requested up to {timing.requested_max_bundles}, got {timing.returned_bundle_count})"
+        )
+    print(f"- generator total: {result.proposal_phase_seconds:.2f}s")
+    print(f"- proposal filter total: {result.proposal_filter_phase_seconds:.2f}s")
+    print(f"- verification total: {result.verification_phase_seconds:.2f}s")
+    print(f"- ranker total: {result.ranking_phase_seconds:.2f}s")
+    print(f"- pipeline total: {result.total_seconds:.2f}s")
+
+    _print_heading("Overview")
     print(f"Equation pool size: {result.eq_pool_size}")
     print(f"Proposal rounds: {len(result.proposal_results)}")
     print(f"All proposed bundles: {len(result.all_proposed_bundles)}")
     print(f"Rejected bundles: {len(result.rejected_bundles)}")
     print(f"Surviving verified bundles: {len(result.verified_records)}")
-    print()
-    print("All proposed bundles:")
-    for bundle in result.all_proposed_bundles:
-        print(
-            f"- round {bundle.round_index} | {bundle.candidate_id} | "
-            f"{bundle.relation_ids} | {bundle.rationale}"
-        )
 
-    print()
-    print("Rejected bundles:")
+    _print_heading("All Proposed Bundles")
+    if not result.all_proposed_bundles:
+        print("- none")
+    for index, bundle in enumerate(result.all_proposed_bundles, start=1):
+        print(
+            f"{index:02d}. round={bundle.round_index} candidate_id={bundle.candidate_id!r} "
+            f"relations={bundle.relation_ids}"
+        )
+        print(f"    rationale: {bundle.rationale}")
+
+    _print_heading("Rejected Bundles")
     if not result.rejected_bundles:
         print("- none")
+    else:
+        print("Summary by reason:")
+        for reason, count in _rejection_reason_counts(result.rejected_bundles):
+            print(f"- {reason}: {count}")
+        print()
     for bundle in result.rejected_bundles:
         print(
             f"- stage={bundle.stage} | relation_ids={bundle.relation_ids} | "
-            f"normalized={bundle.normalized_relation_ids} | reason={bundle.reason}"
+            f"normalized={bundle.normalized_relation_ids}"
         )
+        print(f"  reason: {bundle.reason}")
+        if bundle.candidate_id is not None:
+            print(f"  candidate_id: {bundle.candidate_id!r}")
+        if bundle.rationale:
+            print(f"  rationale: {bundle.rationale}")
 
-    print()
-    print("Final ranked bundles:")
+    _print_heading("Final Ranked Bundles")
     print(f"Ranking summary: {result.ranking_result.summary}")
     print(f"Chosen candidate: {result.ranking_result.chosen_candidate_id}")
 

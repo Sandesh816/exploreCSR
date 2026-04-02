@@ -45,6 +45,8 @@ class ProposalPromptTests(unittest.TestCase):
         self.assertIn("Relation pool:", user_prompt)
         self.assertIn("relation_id=14", user_prompt)
         self.assertIn("Propose at most 8 bundles.", user_prompt)
+        self.assertIn("Each bundle must have a unique non-empty candidate_id.", user_prompt)
+        self.assertIn("If previous rounds are provided, do not repeat those exact bundles", user_prompt)
 
     def test_ranking_messages_wrap_existing_prompt_builder(self) -> None:
         records = [
