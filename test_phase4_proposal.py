@@ -48,6 +48,22 @@ class ProposalPromptTests(unittest.TestCase):
         self.assertIn("Each bundle must have a unique non-empty candidate_id.", user_prompt)
         self.assertIn("If previous rounds are provided, do not repeat those exact bundles", user_prompt)
 
+    def test_proposal_messages_use_soft_bundle_size_preference_when_unbounded(self) -> None:
+        eq_pool = detect_c1_equations(self.c1, linear_only=True, print_list=False)
+        relation_pool = build_relation_records(eq_pool)
+
+        messages = build_bundle_proposal_messages(
+            self.c1,
+            self.c2,
+            relation_pool,
+            max_bundles=8,
+            max_bundle_size=None,
+        )
+
+        user_prompt = messages[-1]["content"]
+        self.assertIn("Prefer smaller sets of relations when they are equally plausible.", user_prompt)
+        self.assertNotIn("Each bundle may include at most", user_prompt)
+
     def test_ranking_messages_wrap_existing_prompt_builder(self) -> None:
         records = [
             BundleRecord(

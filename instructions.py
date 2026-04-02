@@ -49,7 +49,7 @@ def build_bundle_proposal_messages(
     relation_pool: list[RelationRecord],
     *,
     max_bundles: int = 16,
-    max_bundle_size: int = 3,
+    max_bundle_size: Optional[int] = None,
     previous_bundles: Optional[list[tuple[int, ...]]] = None,
 ) -> list[dict[str, str]]:
     lines: list[str] = []
@@ -72,7 +72,10 @@ def build_bundle_proposal_messages(
     lines.append("- A bundle may include other relations that do not individually mention delta.")
     lines.append("- Prefer coherent geometric relationships over algebraically arbitrary combinations.")
     lines.append(f"- Propose at most {max_bundles} bundles.")
-    lines.append(f"- Each bundle may include at most {max_bundle_size} relation IDs.")
+    if max_bundle_size is not None:
+        lines.append(f"- Each bundle may include at most {max_bundle_size} relation IDs.")
+    else:
+        lines.append("- Prefer smaller sets of relations when they are equally plausible.")
     lines.append("- Prefer diversity across the proposed bundles.")
     lines.append("- Each bundle must have a unique non-empty candidate_id.")
     lines.append("- Do not repeat an exact relation-id bundle that already appeared earlier in this response.")

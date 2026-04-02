@@ -214,6 +214,33 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(len(result.bundles), 1)
         self.assertEqual(result.bundles[0].relation_ids, (3, 14))
 
+    def test_parse_bundle_proposal_response_allows_larger_bundles_when_unbounded(self) -> None:
+        response = {
+            "message": {
+                "content": json.dumps(
+                    {
+                        "bundles": [
+                            {
+                                "candidate_id": "LLM-001",
+                                "relation_ids": [1, 2, 3, 4],
+                                "rationale": "Larger bundle remains allowed.",
+                            }
+                        ]
+                    }
+                )
+            }
+        }
+
+        result = parse_bundle_proposal_response(
+            response,
+            valid_relation_ids=set(range(30)),
+            max_bundle_size=None,
+            prompt_text=self.prompt_text,
+        )
+
+        self.assertEqual(len(result.bundles), 1)
+        self.assertEqual(result.bundles[0].relation_ids, (1, 2, 3, 4))
+
 
 class HttpClientTests(unittest.TestCase):
     def setUp(self) -> None:

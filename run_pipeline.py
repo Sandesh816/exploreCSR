@@ -316,7 +316,7 @@ def run_pipeline(
             relation_pool,
             ollama_config,
             max_bundles=requested_max_bundles,
-            max_bundle_size=config.max_system_size,
+            max_bundle_size=None,
             previous_bundles=previous_bundles,
         )
         round_elapsed = perf_counter() - round_start
@@ -349,7 +349,7 @@ def run_pipeline(
         proposed_bundles,
         eq_pool,
         context=context,
-        max_bundle_size=config.max_system_size,
+        max_bundle_size=None,
         max_candidates=config.global_bundle_cap,
     )
     proposal_filter_phase_seconds = perf_counter() - proposal_filter_start

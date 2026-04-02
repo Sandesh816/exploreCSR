@@ -284,7 +284,7 @@ def normalize_candidate_bundle_indices(
     proposed_bundles: Iterable[Iterable[int]],
     eq_pool: list[Equation],
     context: VerifierContext,
-    max_bundle_size: int,
+    max_bundle_size: Optional[int],
     max_candidates: Optional[int] = None,
 ) -> list[Tuple[int, ...]]:
     reviews = review_proposed_bundle_indices(
@@ -306,10 +306,10 @@ def review_proposed_bundle_indices(
     eq_pool: list[Equation],
     context: VerifierContext,
     *,
-    max_bundle_size: int,
+    max_bundle_size: Optional[int],
     max_candidates: Optional[int] = None,
 ) -> list[ProposedBundleReview]:
-    if max_bundle_size <= 0:
+    if max_bundle_size is not None and max_bundle_size <= 0:
         raise ValueError("max_bundle_size must be positive.")
 
     valid_relation_ids = set(range(len(eq_pool)))
@@ -324,7 +324,7 @@ def review_proposed_bundle_indices(
 
         if not normalized_tuple:
             rejection_reason = "empty bundle"
-        elif len(normalized_tuple) > max_bundle_size:
+        elif max_bundle_size is not None and len(normalized_tuple) > max_bundle_size:
             rejection_reason = "bundle exceeds configured maximum size"
         elif any(idx not in valid_relation_ids for idx in normalized_tuple):
             rejection_reason = "bundle contains an invalid relation id"

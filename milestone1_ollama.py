@@ -347,10 +347,10 @@ def parse_ranking_response(
 def parse_bundle_proposal_response(
     raw_response: dict[str, Any],
     valid_relation_ids: set[int],
-    max_bundle_size: int,
+    max_bundle_size: Optional[int],
     prompt_text: str,
 ) -> BundleProposalResult:
-    if max_bundle_size <= 0:
+    if max_bundle_size is not None and max_bundle_size <= 0:
         raise ValueError("max_bundle_size must be positive.")
 
     raw_content = _extract_message_content(raw_response)
@@ -388,7 +388,7 @@ def parse_bundle_proposal_response(
         normalized_ids = tuple(sorted(set(relation_ids)))
         if not normalized_ids:
             continue
-        if len(normalized_ids) > max_bundle_size:
+        if max_bundle_size is not None and len(normalized_ids) > max_bundle_size:
             continue
         if any(relation_id not in valid_relation_ids for relation_id in normalized_ids):
             continue
@@ -468,7 +468,7 @@ def propose_relation_bundles_with_ollama(
     config: OllamaRankerConfig,
     *,
     max_bundles: int = 16,
-    max_bundle_size: int = 3,
+    max_bundle_size: Optional[int] = None,
     previous_bundles: Optional[list[tuple[int, ...]]] = None,
 ) -> BundleProposalResult:
     from instructions import build_bundle_proposal_messages
@@ -500,7 +500,7 @@ def propose_and_collect_candidate_bundles_with_ollama(
     config: OllamaRankerConfig,
     *,
     max_bundles: int = 16,
-    max_bundle_size: int = 3,
+    max_bundle_size: Optional[int] = None,
     max_system_size: int = 3,
     max_candidates: int = 128,
     previous_bundles: Optional[list[tuple[int, ...]]] = None,
